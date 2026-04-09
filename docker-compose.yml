@@ -1,0 +1,27 @@
+version: "3.8"
+
+# =============================================================================
+# Articulation Service — Docker Compose
+#
+# Quick start:
+#   docker compose up -d --build
+# =============================================================================
+
+services:
+  articulation:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    image: articulation-service:latest
+    container_name: articulation-service
+
+    ports:
+      - "${API_PORT:-52071}:52071"
+
+    volumes:
+      - ${OUTPUT_PATH:-./outputs}:/app/outputs:rw
+      - ${UPLOAD_PATH:-./uploads}:/app/uploads:rw
+      - ./logs:/app/logs
+
+    restart: unless-stopped
