@@ -19,7 +19,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # System deps for Pillow / trimesh / OpenGL (headless)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1-mesa-glx libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
     libjpeg-dev libpng-dev \
     && rm -rf /var/lib/apt/lists/*
 
