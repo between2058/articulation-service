@@ -126,6 +126,7 @@ class USDBuilder:
         vertices: np.ndarray,
         faces: np.ndarray,
         normals: Optional[np.ndarray] = None,
+        uvs: Optional[np.ndarray] = None,
         transform: Optional[Tuple[Tuple[float, ...], ...]] = None,
         material: Optional[ParsedMaterial] = None,
     ) -> str:
@@ -185,6 +186,17 @@ class USDBuilder:
             )
             mesh.CreateNormalsAttr(normal_array)
             mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+
+        # Set UV coordinates if provided (needed for texture mapping)
+        if uvs is not None:
+            st_array = Vt.Vec2fArray(
+                [Gf.Vec2f(float(uv[0]), float(uv[1])) for uv in uvs]
+            )
+            primvar_api = UsdGeom.PrimvarsAPI(mesh)
+            st_primvar = primvar_api.CreatePrimvar(
+                "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex
+            )
+            st_primvar.Set(st_array)
 
         # Subdivision scheme = none (render actual triangles)
         mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
@@ -323,9 +335,10 @@ class USDBuilder:
         tex_shader = UsdShade.Shader.Define(stage, tex_shader_path)
         tex_shader.CreateIdAttr("UsdUVTexture")
 
-        # Set file path
+        # Set file path (relative to USDA output directory for correct resolution)
+        rel_path = os.path.relpath(texture_file_path, str(self.output_dir))
         tex_shader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
-            Sdf.AssetPath(texture_file_path)
+            Sdf.AssetPath(rel_path)
         )
 
         # Set default wrap modes
@@ -397,13 +410,23 @@ class USDBuilder:
             # Extract material (ParsedMaterial or None)
             material = data.get("material")
 
+            # Transform from Y-up (GLB) to Z-up (USD/Isaac Sim)
+            # Rotation 90° around X: x' = x, y' = -z, z' = y
+            verts = data["vertices"]
+            verts_zup = np.column_stack([verts[:, 0], -verts[:, 2], verts[:, 1]])
+
+            normals = data.get("normals")
+            if normals is not None:
+                normals = np.column_stack([normals[:, 0], -normals[:, 2], normals[:, 1]])
+
             prim_path = self.add_mesh_prim(
                 stage=stage,
                 parent_path=root_path,
                 name=part_name,
-                vertices=data["vertices"],
+                vertices=verts_zup,
                 faces=data["faces"],
-                normals=data.get("normals"),
+                normals=normals,
+                uvs=data.get("uvs"),
                 material=material,
             )
 

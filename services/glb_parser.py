@@ -373,6 +373,13 @@ class GLBParser:
 
     def _mesh_to_dict(self, mesh: trimesh.Trimesh) -> Dict[str, Any]:
         """Convert trimesh to dict with numpy arrays."""
+        uvs = None
+        if hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
+            try:
+                uvs = mesh.visual.uv.astype(np.float32)
+            except Exception:
+                pass
+
         return {
             "vertices": mesh.vertices.astype(np.float32),
             "faces": mesh.faces.astype(np.int32),
@@ -381,6 +388,7 @@ class GLBParser:
                 if mesh.vertex_normals is not None
                 else None
             ),
+            "uvs": uvs,
         }
 
     def _generate_unique_id(self, base_name: str, used_names: set) -> str:
