@@ -12,9 +12,18 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        http_proxy: http://proxy.intra:80
+        https_proxy: http://proxy.intra:80
+        no_proxy: localhost,127.0.0.1
 
     image: articulation-service:latest
     container_name: articulation-service
+
+    environment:
+      - http_proxy=http://proxy.intra:80
+      - https_proxy=http://proxy.intra:80
+      - no_proxy=localhost,127.0.0.1
 
     ports:
       - "${API_PORT:-52071}:52071"

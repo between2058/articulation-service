@@ -12,7 +12,10 @@ FROM python:3.10-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    http_proxy=http://proxy.intra:80 \
+    https_proxy=http://proxy.intra:80 \
+    no_proxy=localhost,127.0.0.1
 
 # System deps for Pillow / trimesh / OpenGL (headless)
 RUN apt-get update && apt-get install -y --no-install-recommends \
