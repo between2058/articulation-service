@@ -979,23 +979,18 @@ class GLBParser:
             except Exception:
                 pass
 
-            # If we have GLTF data, build mapping from geometry to material index
+            # Build a list of material indices from GLTF mesh primitives,
+            # ordered by primitive appearance (which matches how trimesh
+            # loads geometries into scene.geometry).
+            primitive_material_indices = []
             if gltf and 'meshes' in gltf:
-                for mesh_idx, mesh_def in enumerate(gltf['meshes']):
-                    if 'extras' in mesh_def and 'targetNames' in mesh_def['extras']:
-                        # This might be a skinned mesh or have target names
-                        pass
-                    # Look for material index in mesh definition
-                    if 'primitives' in mesh_def and len(mesh_def['primitives']) > 0:
-                        # For simplicity, use the material of the first primitive
-                        primitive = mesh_def['primitives'][0]
-                        if 'material' in primitive:
-                            material_index = primitive['material']
-                            # We need to map this back to geometry name
-                            # This is tricky without more info from GLTF
-                            # For now, we'll try to match by index
+                for mesh_def in gltf['meshes']:
+                    for prim in mesh_def.get('primitives', []):
+                        primitive_material_indices.append(prim.get('material', 0))
 
-            # Iterate using node names
+            # Iterate using node names — match each geometry to its
+            # material index by position in the primitive list.
+            geom_idx = 0
             for geometry_key, mesh in scene.geometry.items():
                 if not isinstance(mesh, trimesh.Trimesh):
                     continue
@@ -1004,9 +999,12 @@ class GLBParser:
                 part_id = self._generate_unique_id(original_name, used_names)
                 used_names.add(part_id)
 
-                # Try to determine material index for this geometry
-                # For now, assume materials are assigned in order or use first material
-                material_index = 0
+                # Use the material index from GLTF primitive order
+                if geom_idx < len(primitive_material_indices):
+                    material_index = primitive_material_indices[geom_idx]
+                else:
+                    material_index = 0
+                geom_idx += 1
 
                 result[part_id] = self._mesh_to_dict(mesh, filepath, material_index, extracted_textures, extracted_data)
 

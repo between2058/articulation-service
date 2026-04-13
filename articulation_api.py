@@ -434,6 +434,155 @@ async def _export(
         )
 
 
+@app.post("/api/debug-glb")
+async def debug_glb(file: UploadFile = File(...)):
+    """
+    Upload a GLB and return a diagnostic report showing what the
+    pipeline sees at each step. Use this to find why materials are missing.
+    """
+    import json as _json
+    import struct
+
+    if not file.filename.lower().endswith(".glb"):
+        raise HTTPException(status_code=400, detail="Only .glb files are supported")
+
+    unique_id = str(uuid.uuid4())[:8]
+    safe_filename = f"{unique_id}_{file.filename}"
+    glb_path = UPLOAD_DIR / safe_filename
+
+    report = {"filename": file.filename, "steps": {}}
+
+    try:
+        content = await file.read()
+        with open(glb_path, "wb") as f:
+            f.write(content)
+
+        # ---- Step 1: Read GLTF JSON from GLB ----
+        step1 = {}
+        try:
+            with open(glb_path, 'rb') as f:
+                f.read(12)
+                jlen = struct.unpack('<I', f.read(4))[0]
+                f.read(4)
+                gltf = _json.loads(f.read(jlen))
+
+            step1["materials_count"] = len(gltf.get('materials', []))
+            step1["images_count"] = len(gltf.get('images', []))
+            step1["textures_count"] = len(gltf.get('textures', []))
+            step1["meshes_count"] = len(gltf.get('meshes', []))
+
+            materials_detail = []
+            for i, mat in enumerate(gltf.get('materials', [])):
+                pbr = mat.get('pbrMetallicRoughness', {})
+                materials_detail.append({
+                    "index": i,
+                    "name": mat.get("name", "unnamed"),
+                    "baseColorFactor": pbr.get('baseColorFactor', 'N/A'),
+                    "hasBaseColorTexture": 'baseColorTexture' in pbr,
+                    "baseColorTextureIndex": pbr.get('baseColorTexture', {}).get('index', 'N/A'),
+                    "metallicFactor": pbr.get('metallicFactor', 'N/A'),
+                    "roughnessFactor": pbr.get('roughnessFactor', 'N/A'),
+                })
+            step1["materials"] = materials_detail
+
+            # Show mesh-to-material mapping
+            meshes_detail = []
+            for i, mesh_def in enumerate(gltf.get('meshes', [])):
+                for j, prim in enumerate(mesh_def.get('primitives', [])):
+                    meshes_detail.append({
+                        "mesh": i,
+                        "primitive": j,
+                        "material_index": prim.get('material', 'NONE'),
+                    })
+            step1["mesh_primitives"] = meshes_detail
+
+        except Exception as e:
+            step1["error"] = str(e)
+        report["steps"]["1_gltf_json"] = step1
+
+        # ---- Step 2: Extract textures ----
+        step2 = {}
+        try:
+            extracted_textures, extracted_data = glb_parser.extract_textures(
+                str(glb_path), glb_path.stem
+            )
+            texture_dir = OUTPUT_DIR / glb_path.stem
+            step2["extracted_count"] = len(extracted_textures)
+            tex_details = []
+            for idx, fname in extracted_textures.items():
+                fpath = texture_dir / fname
+                tex_details.append({
+                    "image_index": idx,
+                    "filename": fname,
+                    "exists_on_disk": fpath.exists(),
+                    "size_bytes": fpath.stat().st_size if fpath.exists() else 0,
+                })
+            step2["textures"] = tex_details
+        except Exception as e:
+            step2["error"] = str(e)
+        report["steps"]["2_texture_extraction"] = step2
+
+        # ---- Step 3: get_all_mesh_data ----
+        step3 = {}
+        try:
+            mesh_data = glb_parser.get_all_mesh_data(str(glb_path))
+            step3["parts_count"] = len(mesh_data)
+            parts_detail = []
+            for part_id, data in mesh_data.items():
+                mat = data.get('material')
+                has_uv = data.get('uv_coords') is not None
+                detail = {
+                    "part_id": part_id,
+                    "vertex_count": len(data['vertices']),
+                    "has_uv_coords": has_uv,
+                    "uv_count": len(data['uv_coords']) if has_uv else 0,
+                    "has_material": mat is not None,
+                }
+                if mat is not None:
+                    detail["material_type"] = type(mat).__name__
+                    detail["diffuse_color"] = list(getattr(mat, 'diffuse_color', []))
+                    detail["has_base_color_texture"] = getattr(mat, 'has_base_color_texture', False)
+                    tex = getattr(mat, 'base_color_texture', None)
+                    detail["texture_filename"] = getattr(tex, 'filename', None) if tex else None
+                else:
+                    detail["material_type"] = "None"
+                    detail["PROBLEM"] = "No material extracted! Model will be white."
+                parts_detail.append(detail)
+            step3["parts"] = parts_detail
+        except Exception as e:
+            step3["error"] = str(e)
+        report["steps"]["3_mesh_data"] = step3
+
+        # ---- Summary ----
+        problems = []
+        if step1.get("images_count", 0) == 0:
+            problems.append("GLB has NO embedded images — no textures possible")
+        if step1.get("materials_count", 0) == 0:
+            problems.append("GLB has NO materials defined")
+        for mat in step1.get("materials", []):
+            if not mat.get("hasBaseColorTexture") and mat.get("baseColorFactor") in ([1, 1, 1, 1], [1.0, 1.0, 1.0, 1.0], 'N/A'):
+                problems.append(f"Material[{mat['index']}] '{mat['name']}': white color + no texture = WHITE")
+        if step2.get("extracted_count", 0) == 0 and step1.get("images_count", 0) > 0:
+            problems.append("Images exist in GLTF but extraction FAILED")
+        for p in step3.get("parts", []):
+            if not p.get("has_material"):
+                problems.append(f"Part '{p['part_id']}': no material extracted")
+            elif p.get("has_base_color_texture") and not p.get("texture_filename"):
+                problems.append(f"Part '{p['part_id']}': has texture flag but no filename")
+            elif not p.get("has_base_color_texture") and p.get("diffuse_color") == [1.0, 1.0, 1.0]:
+                problems.append(f"Part '{p['part_id']}': white diffuse + no texture = WHITE")
+
+        report["problems"] = problems if problems else ["No obvious problems detected"]
+
+        return JSONResponse(content=report)
+
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+    finally:
+        if glb_path.exists():
+            glb_path.unlink(missing_ok=True)
+
+
 @app.get("/api/download/{filename}")
 async def download_file(filename: str):
     """Download a generated USD/USDZ file."""
