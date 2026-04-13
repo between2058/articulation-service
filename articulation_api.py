@@ -17,6 +17,7 @@ import logging
 import logging.handlers
 import datetime
 from pathlib import Path
+from shutil import copy2
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
@@ -32,6 +33,7 @@ from models.schemas import (
 from services.glb_parser import glb_parser
 from services.usd_builder import usd_builder
 from services.physics_injector import physics_injector
+from services.usdz_packager import usdz_packager
 
 # =============================================================================
 # Logging
@@ -217,12 +219,25 @@ async def _export(
     articulation_json: str,
     fmt: str,
 ) -> ExportResponse:
-    """Shared export logic for USDA and USDZ."""
-    # Validate file
+    """
+    Shared export logic for USDA and USDZ.
+
+    Follows the exact flow from articulation-editor bugfix--usdz-texture:
+    1. Save GLB
+    2. get_all_mesh_data (extracts textures from BIN chunk + returns MaterialInfo)
+    3. extract_textures again (cached) to get filename list
+    4. Build texture_mapping: old_path -> simple sequential name
+    5. Update MaterialInfo texture filenames to mapped names
+    6. build_from_parts (USD references ./texture_name.png)
+    7. inject_physics
+    8. save_stage
+    9. Copy textures to USDA directory
+    10. Package USDZ with ARKit packager
+    11. Clean up temp files
+    """
     if not file.filename.lower().endswith(".glb"):
         raise HTTPException(status_code=400, detail="Only .glb files are supported")
 
-    # Parse articulation JSON
     try:
         art_data = ArticulationData.model_validate_json(articulation_json)
     except Exception as e:
@@ -230,7 +245,6 @@ async def _export(
             status_code=400, detail=f"Invalid articulation JSON: {e}"
         )
 
-    # Save uploaded GLB to temp location
     unique_id = str(uuid.uuid4())[:8]
     safe_filename = f"{unique_id}_{file.filename}"
     glb_path = UPLOAD_DIR / safe_filename
@@ -242,7 +256,7 @@ async def _export(
 
         logger.info(f"Saved GLB for export: {glb_path} ({len(content)} bytes)")
 
-        # Get mesh data (with materials) from GLB
+        # ---- Step 1: Get mesh data (triggers texture extraction internally) ----
         mesh_data = glb_parser.get_all_mesh_data(str(glb_path))
 
         if not mesh_data:
@@ -250,7 +264,68 @@ async def _export(
                 status_code=400, detail="No mesh data found in GLB file"
             )
 
-        # Build part info list
+        # ---- Step 2: Extract textures (cached from step 1) ----
+        glb_name = glb_path.stem
+        texture_dir = OUTPUT_DIR / glb_name
+        texture_files = []
+        texture_mapping = {}
+
+        try:
+            extracted_textures, extracted_data = glb_parser.extract_textures(
+                str(glb_path), glb_name
+            )
+            if extracted_textures:
+                texture_files = [
+                    str(texture_dir / fname)
+                    for fname in extracted_textures.values()
+                ]
+                for idx, fname in enumerate(extracted_textures.values()):
+                    old_path = str(texture_dir / fname)
+                    new_name = f"texture_{idx}{Path(fname).suffix}"
+                    texture_mapping[old_path] = new_name
+                    print(f"[INFO] Texture mapping: {fname} -> {new_name}")
+
+                print(f"[INFO] Extracted {len(texture_files)} textures to {texture_dir}")
+        except Exception as e:
+            print(f"[WARNING] Could not extract textures: {e}")
+
+        # ---- Step 3: Update MaterialInfo texture filenames to mapped names ----
+        # (Copied from editor routes.py — handles both MaterialInfo objects and dicts)
+        if texture_mapping:
+            for part_id, data in mesh_data.items():
+                if 'material' not in data:
+                    continue
+                material = data['material']
+
+                # Base color texture
+                if hasattr(material, 'has_base_color_texture') and material.has_base_color_texture and material.base_color_texture:
+                    base_color_texture = material.base_color_texture
+                    if hasattr(base_color_texture, 'filename') and base_color_texture.filename:
+                        old_texture_name = base_color_texture.filename
+                        for old_path, new_name in texture_mapping.items():
+                            if old_texture_name and old_texture_name in old_path:
+                                base_color_texture.filename = new_name
+                                print(f"[DEBUG] Updated base color texture: {old_texture_name} -> {new_name}")
+                                break
+
+                # Other texture channels
+                texture_channels = [
+                    'metallic_roughness_texture', 'normal_texture',
+                    'occlusion_texture', 'emissive_texture',
+                ]
+                for channel in texture_channels:
+                    attr_name = f'has_{channel}'
+                    if hasattr(material, attr_name) and getattr(material, attr_name) and hasattr(material, channel):
+                        texture_info = getattr(material, channel)
+                        if texture_info and hasattr(texture_info, 'filename') and texture_info.filename:
+                            old_texture_name = texture_info.filename
+                            for old_path, new_name in texture_mapping.items():
+                                if old_texture_name in old_path:
+                                    texture_info.filename = new_name
+                                    print(f"[DEBUG] Updated {channel}: {old_texture_name} -> {new_name}")
+                                    break
+
+        # ---- Step 4: Build part info list ----
         part_info = [
             {
                 "id": part.id,
@@ -262,53 +337,70 @@ async def _export(
             for part in art_data.parts
         ]
 
-        # Determine output filename
+        # ---- Step 5: Build USD stage ----
         base_name = art_data.model_name or "robot"
         usda_filename = f"{base_name}_{unique_id}.usda"
 
-        # Build USD stage with meshes + materials
+        embed_textures = False  # Always reference externally
+
         stage, part_paths = usd_builder.build_from_parts(
             filename=usda_filename,
             model_name=art_data.model_name,
             mesh_data=mesh_data,
             part_info=part_info,
+            embed_textures=embed_textures,
+            texture_files_dir=str(texture_dir) if texture_dir.exists() else None,
         )
 
-        # Inject physics schemas
+        # ---- Step 6: Inject physics ----
         physics_injector.inject_physics(
             stage=stage,
             articulation_data=art_data,
             part_paths=part_paths,
         )
 
-        # Save stage
-        usd_builder.save_stage(stage)
+        # ---- Step 7: Save USD stage ----
+        usd_path = usd_builder.save_stage(stage)
 
-        # If USDZ requested, package into .usdz
+        # ---- Step 8: Copy textures to USD directory ----
+        copied_textures = []
+        if texture_files and texture_mapping:
+            usd_dir = Path(usd_path).parent
+            print(f"[INFO] Copying {len(texture_files)} textures to USD directory: {usd_dir}")
+
+            for old_path, new_name in texture_mapping.items():
+                dest_path = usd_dir / new_name
+                try:
+                    copy2(old_path, dest_path)
+                    copied_textures.append(dest_path)
+                    print(f"[INFO] Copied texture: {old_path} -> {dest_path}")
+                except Exception as e:
+                    print(f"[WARNING] Failed to copy texture {old_path} -> {dest_path}: {e}")
+
+        # ---- Step 9: Package USDZ if requested ----
         if fmt == "usdz":
             usdz_filename = f"{base_name}_{unique_id}.usdz"
-            usdz_path = OUTPUT_DIR / usdz_filename
-            usda_path = OUTPUT_DIR / usda_filename
 
             try:
-                from pxr import UsdUtils
-
-                success = UsdUtils.CreateNewUsdzPackage(
-                    Sdf.AssetPath(str(usda_path)),
-                    str(usdz_path),
+                usdz_path = usdz_packager.create_usdz(
+                    usd_file_path=usd_path,
+                    texture_files=texture_files if texture_files else None,
+                    texture_mapping=texture_mapping if texture_mapping else None,
+                    output_filename=usdz_filename,
                 )
-                if not success:
-                    raise RuntimeError("UsdUtils.CreateNewUsdzPackage returned False")
 
-                logger.info(f"Packaged USDZ: {usdz_path}")
+                # Clean up temporary USDA and copied textures
+                try:
+                    Path(usd_path).unlink()
+                    for texture_path in copied_textures:
+                        if texture_path.exists():
+                            texture_path.unlink()
+                            print(f"[INFO] Cleaned up temporary texture: {texture_path}")
+                except Exception as e:
+                    print(f"[WARNING] Failed to clean up temporary files: {e}")
 
-                # Import Sdf at module level is fine, but we need it here
-                # for the AssetPath if not already imported
-            except ImportError:
-                raise HTTPException(
-                    status_code=500,
-                    detail="UsdUtils not available for USDZ packaging",
-                )
+                logger.info(f"Exported USDZ: {usdz_path}")
+
             except Exception as e:
                 logger.error(f"USDZ packaging failed: {e}", exc_info=True)
                 raise HTTPException(

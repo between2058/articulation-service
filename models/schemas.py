@@ -1,49 +1,73 @@
 """
 Pydantic schemas for Phidias Articulation Service.
 
-Defines data models for:
-- ParsedMaterial: PBR material data extracted from GLB meshes
-- ParsedPart: Individual mesh parts with geometric info
-- ArticulationPart: Part with semantic labels for physics
-- ArticulationJoint: Joint connecting two parts
-- ArticulationData: Complete model data for USD export
-- UploadResponse: API response after GLB upload/parse
-- ExportResponse: API response after USD export
+Combines editor bugfix-branch material schemas (TextureInfo, MaterialInfo)
+with the service's physics schemas (ArticulationPart/Joint/Data).
 """
 
 from typing import List, Literal, Tuple, Optional
 from pydantic import BaseModel, Field
 
 
-class ParsedMaterial(BaseModel):
-    """
-    PBR material data extracted from a GLB mesh.
+# ---------------------------------------------------------------------------
+# Material schemas (from articulation-editor bugfix--usdz-texture)
+# ---------------------------------------------------------------------------
 
-    Stores the metallic-roughness PBR parameters needed
-    to reconstruct UsdPreviewSurface materials in USD.
-    """
-    name: str = Field(default="default", description="Material name from GLB")
-    base_color_factor: Tuple[float, float, float, float] = Field(
-        default=(0.8, 0.8, 0.8, 1.0),
-        description="Base color RGBA (linear, 0-1)",
-    )
-    base_color_texture_path: Optional[str] = Field(
-        default=None,
-        description="Path to saved base-color texture PNG (None if no texture)",
-    )
-    metallic_factor: float = Field(
-        default=0.0,
-        description="Metallic factor 0-1",
-    )
-    roughness_factor: float = Field(
-        default=0.5,
-        description="Roughness factor 0-1",
-    )
-    normal_texture_path: Optional[str] = Field(
-        default=None,
-        description="Path to saved normal-map texture PNG (None if no texture)",
-    )
+class TextureInfo(BaseModel):
+    """Information about a texture used in a material."""
+    index: int
+    filename: Optional[str] = None
+    source: Optional[str] = None  # MIME type or source info
+    has_data: bool = False  # Whether raw texture data is available
 
+
+class MaterialInfo(BaseModel):
+    """
+    Enhanced material information extracted from GLB materials.
+    Supports PBR properties, texture channels, and advanced material types.
+    """
+    # Basic PBR properties
+    diffuse_color: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+    alpha: float = 1.0
+    metallic: float = 0.0
+    roughness: float = 0.5
+
+    # Texture information
+    has_base_color_texture: bool = False
+    base_color_texture: Optional[TextureInfo] = None
+
+    # Advanced texture channels (for separated channels)
+    has_metallic_roughness_texture: bool = False
+    metallic_roughness_texture: Optional[TextureInfo] = None
+
+    has_normal_texture: bool = False
+    normal_texture: Optional[TextureInfo] = None
+
+    has_occlusion_texture: bool = False
+    occlusion_texture: Optional[TextureInfo] = None
+
+    has_emissive_texture: bool = False
+    emissive_texture: Optional[TextureInfo] = None
+
+    # Emissive properties
+    emissive_factor: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+    # Material flags
+    double_sided: bool = False
+    alpha_mode: str = "OPAQUE"  # OPAQUE, MASK, BLEND
+
+    # Texture transform (KHR_texture_transform extension)
+    tex_coord_offset: Tuple[float, float] = (0.0, 0.0)
+    tex_coord_scale: Tuple[float, float] = (1.0, 1.0)
+    tex_coord_rotation: float = 0.0  # in radians
+
+    # Material type
+    is_unlit: bool = False  # KHR_materials_unlit extension
+
+
+# ---------------------------------------------------------------------------
+# Parse response
+# ---------------------------------------------------------------------------
 
 class ParsedPart(BaseModel):
     """
@@ -57,28 +81,15 @@ class ParsedPart(BaseModel):
     bounds_min: Tuple[float, float, float] = (0, 0, 0)
     bounds_max: Tuple[float, float, float] = (0, 0, 0)
     is_watertight: bool = True
-    material: Optional[ParsedMaterial] = Field(
-        default=None,
-        description="PBR material data for this part",
-    )
+    material: Optional[MaterialInfo] = None
 
+
+# ---------------------------------------------------------------------------
+# Physics / articulation schemas (service-specific, used by physics_injector)
+# ---------------------------------------------------------------------------
 
 class ArticulationPart(BaseModel):
-    """
-    Represents a single mesh part with physics semantics.
-
-    Attributes:
-        id: Unique identifier (mesh name from GLB)
-        name: Human-readable name
-        type: Semantic type (link / base / tool)
-        role: Functional role
-        mobility: How the part can move
-        mass: Mass in kg (None = auto-compute)
-        density: Density in kg/m³
-        center_of_mass: CoM offset [x, y, z]
-        collision_type: Collision approximation
-        static_friction / dynamic_friction / restitution: Physics material
-    """
+    """Represents a single mesh part with physics semantics."""
     id: str = Field(..., description="Unique part identifier from mesh name")
     name: str = Field(..., description="Display name for the part")
     type: Literal["link", "joint", "base", "tool"] = Field(
@@ -121,20 +132,7 @@ class ArticulationPart(BaseModel):
 
 
 class ArticulationJoint(BaseModel):
-    """
-    Represents an articulation joint connecting two parts.
-
-    Attributes:
-        name: Unique joint name
-        parent: Parent part ID
-        child: Child part ID
-        type: Joint type (fixed / revolute / prismatic)
-        axis: Direction vector [x, y, z]
-        anchor: Pivot point relative to child frame
-        lower_limit / upper_limit: Motion limits
-        drive_*: Motor control parameters
-        disable_collision: Disable collision between parent and child
-    """
+    """Represents an articulation joint connecting two parts."""
     name: str = Field(..., description="Unique joint name")
     parent: str = Field(..., description="Parent part ID")
     child: str = Field(..., description="Child part ID")
@@ -152,60 +150,29 @@ class ArticulationJoint(BaseModel):
     )
 
     # Joint limits
-    lower_limit: Optional[float] = Field(
-        default=-180.0,
-        description="Lower motion limit (degrees for revolute, meters for prismatic)",
-    )
-    upper_limit: Optional[float] = Field(
-        default=180.0,
-        description="Upper motion limit (degrees for revolute, meters for prismatic)",
-    )
+    lower_limit: Optional[float] = Field(default=-180.0)
+    upper_limit: Optional[float] = Field(default=180.0)
 
     # Drive parameters
-    drive_stiffness: Optional[float] = Field(
-        default=1000.0,
-        description="Position drive stiffness (spring constant)",
-    )
-    drive_damping: Optional[float] = Field(
-        default=100.0,
-        description="Velocity drive damping",
-    )
-    drive_max_force: Optional[float] = Field(
-        default=1000.0,
-        description="Maximum drive force/torque",
-    )
-    drive_type: Literal["position", "velocity", "none"] = Field(
-        default="position",
-        description="Type of joint drive",
-    )
+    drive_stiffness: Optional[float] = Field(default=1000.0)
+    drive_damping: Optional[float] = Field(default=100.0)
+    drive_max_force: Optional[float] = Field(default=1000.0)
+    drive_type: Literal["position", "velocity", "none"] = Field(default="position")
 
     # Collision filtering
-    disable_collision: bool = Field(
-        default=True,
-        description="Disable collision between parent and child bodies",
-    )
+    disable_collision: bool = Field(default=True)
 
 
 class ArticulationData(BaseModel):
-    """
-    Complete articulation data for USD export.
+    """Complete articulation data for USD export."""
+    model_name: str = Field(default="robot")
+    parts: List[ArticulationPart] = Field(default_factory=list)
+    joints: List[ArticulationJoint] = Field(default_factory=list)
 
-    Contains all parts and joints needed to generate a physics-enabled
-    USD file compatible with NVIDIA Isaac Sim.
-    """
-    model_name: str = Field(
-        default="robot",
-        description="Name for the USD root prim",
-    )
-    parts: List[ArticulationPart] = Field(
-        default_factory=list,
-        description="List of all parts in the model",
-    )
-    joints: List[ArticulationJoint] = Field(
-        default_factory=list,
-        description="List of all joints in the model",
-    )
 
+# ---------------------------------------------------------------------------
+# API response schemas
+# ---------------------------------------------------------------------------
 
 class UploadResponse(BaseModel):
     """Response after successfully uploading and parsing a GLB file."""

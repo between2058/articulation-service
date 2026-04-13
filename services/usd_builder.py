@@ -2,14 +2,15 @@
 USD Builder Service
 
 Builds USD (Universal Scene Description) stages from mesh data.
-Creates the scene hierarchy with Xform and Mesh prims, and applies
-UsdPreviewSurface materials so models render with correct colors
-in NVIDIA Isaac Sim (fixing the white-model bug).
+Creates the scene hierarchy with Xform and Mesh prims.
 
-Key additions over the articulation-mvp version:
-- _apply_material()    creates UsdShade.Material + UsdPreviewSurface shader
-- _create_uv_texture() creates UsdUVTexture node for base color / normal maps
-- Materials are bound to mesh prims via UsdShade.MaterialBindingAPI
+This module handles:
+- Creating USD stage with proper metadata
+- Adding mesh geometry as Mesh prims
+- Setting up Xform hierarchy for parts
+- Basic geometry conversion from numpy arrays
+
+The physics schemas are added separately by physics_injector.py
 """
 
 import os
@@ -20,103 +21,232 @@ from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 
 # USD imports
-from pxr import Usd, UsdGeom, UsdShade, Gf, Vt, Sdf, Ar
-
-from models.schemas import ParsedMaterial
+from pxr import Usd, UsdGeom, Gf, Vt, Sdf, Tf
 
 logger = logging.getLogger(__name__)
 
 
 class USDBuilder:
     """
-    Builds USD stages from mesh data with proper PBR materials.
-
-    Creates a well-structured USD file with:
-    - Xform hierarchy for parts
-    - Mesh prims with geometry
-    - UsdPreviewSurface materials (diffuseColor, metallic, roughness, textures)
-    - Suitable for physics simulation in Isaac Sim
+    Builds USD stages from mesh data.
+    
+    Creates a well-structured USD file with proper hierarchy
+    suitable for physics simulation in Isaac Sim.
     """
-
+    
     def __init__(self, output_dir: str = "outputs"):
         """
         Initialize the USD builder.
-
+        
         Args:
             output_dir: Directory to save generated USD files
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-
-    # ------------------------------------------------------------------
-    # Stage creation
-    # ------------------------------------------------------------------
-
+    
     def create_stage(
         self,
         filename: str,
         model_name: str = "Robot",
         up_axis: str = "Z",
-        meters_per_unit: float = 1.0,
+        meters_per_unit: float = 1.0
     ) -> Usd.Stage:
         """
         Create a new USD stage with proper settings.
-
+        
         Args:
             filename: Output filename (without path)
             model_name: Name for the root prim
             up_axis: Up axis ("Y" or "Z")
             meters_per_unit: Scale factor (1.0 = meters)
-
+            
         Returns:
             Usd.Stage object
         """
         filepath = self.output_dir / filename
-
+        
+        # Create the stage
         stage = Usd.Stage.CreateNew(str(filepath))
-
+        
         # Set stage metadata
-        UsdGeom.SetStageUpAxis(
-            stage,
-            UsdGeom.Tokens.z if up_axis == "Z" else UsdGeom.Tokens.y,
-        )
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z if up_axis == "Z" else UsdGeom.Tokens.y)
         UsdGeom.SetStageMetersPerUnit(stage, meters_per_unit)
-
+        
         # Create root prim
         root_path = f"/{self._sanitize_prim_name(model_name)}"
         root_xform = UsdGeom.Xform.Define(stage, root_path)
-
+        
+        # Set as default prim
         stage.SetDefaultPrim(root_xform.GetPrim())
-
+        
         logger.info(f"Created USD stage: {filepath}")
+        
         return stage
-
-    # ------------------------------------------------------------------
-    # Physics scene
-    # ------------------------------------------------------------------
-
+    
     def add_physics_scene(self, stage: Usd.Stage) -> str:
         """
         Add a PhysicsScene prim to the stage.
-
+        
         The PhysicsScene is required for simulation and defines
         global physics parameters like gravity.
+        
+        Args:
+            stage: USD stage
+            
+        Returns:
+            Path to the PhysicsScene prim
         """
         from pxr import UsdPhysics
-
+        
         root_prim = stage.GetDefaultPrim()
         scene_path = root_prim.GetPath().AppendChild("PhysicsScene")
-
+        
+        # Define physics scene
         physics_scene = UsdPhysics.Scene.Define(stage, scene_path)
+        
+        # Set gravity for Z-up axis (Isaac Sim convention)
         physics_scene.CreateGravityDirectionAttr(Gf.Vec3f(0, 0, -1))
         physics_scene.CreateGravityMagnitudeAttr(9.81)
-
+        
         logger.info(f"Added PhysicsScene at {scene_path}")
+
         return str(scene_path)
 
-    # ------------------------------------------------------------------
-    # Mesh prim
-    # ------------------------------------------------------------------
+    def create_material(
+        self,
+        stage: Usd.Stage,
+        parent_path: str,
+        name: str,
+        material_info: Dict[str, Any],
+        model_name: str = None,
+        embed_textures: bool = False,
+        texture_files_dir: str = None
+    ) -> str:
+        """
+        Create a USD Preview Surface material with proper relative texture paths for USDZ packaging.
+
+        Creates materials under Looks path using UsdPreviewSurface for better compatibility.
+        Textures are referenced with relative paths for proper USDZ packaging.
+
+        Args:
+            stage: USD stage
+            parent_path: Parent path (e.g., "/Robot")
+            name: Material name
+            material_info: Dict or MaterialInfo with material properties
+            model_name: Name of the model (used for texture path resolution)
+            embed_textures: If True, embed texture data directly in USD file
+            texture_files_dir: Directory where texture files are located (for USDZ)
+
+        Returns:
+            Path to the created Material prim
+        """
+        from pxr import UsdShade
+
+        # Sanitize name for USD
+        safe_name = self._sanitize_prim_name(name)
+
+        # Create Looks path following USD conventions
+        looks_path = f"{parent_path}/Looks"
+        if not stage.GetPrimAtPath(looks_path):
+            UsdGeom.Xform.Define(stage, looks_path)
+
+        # Create Material prim under Looks
+        material_path = f"{looks_path}/{safe_name}"
+        material = UsdShade.Material.Define(stage, material_path)
+
+        # Handle different material info formats (dict vs MaterialInfo)
+        if hasattr(material_info, 'diffuse_color'):
+            # MaterialInfo object
+            diffuse_color = material_info.diffuse_color
+            metallic = material_info.metallic
+            roughness = material_info.roughness
+            has_base_color_texture = material_info.has_base_color_texture
+            base_color_texture = material_info.base_color_texture
+        else:
+            # Dict format (backward compatibility)
+            diffuse_color = material_info.get('diffuse_color', [0.8, 0.8, 0.8])
+            metallic = material_info.get('metallic', 0.0)
+            roughness = material_info.get('roughness', 0.5)
+            has_base_color_texture = material_info.get('has_base_color_texture', False)
+            base_color_texture = material_info.get('base_color_texture')
+
+        # Create preview surface shader (simpler and more compatible than MDL)
+        shader_path = f"{material_path}/shader"
+        shader = UsdShade.Shader.Define(stage, shader_path)
+        shader.CreateIdAttr("UsdPreviewSurface")
+
+        # Set basic material properties
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(diffuse_color[0], diffuse_color[1], diffuse_color[2]))
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(float(roughness))
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(float(metallic))
+
+        # If we have a texture, create texture node and connect it with RELATIVE path
+        if has_base_color_texture and base_color_texture:
+            texture_filename = getattr(base_color_texture, 'filename', base_color_texture) if not isinstance(base_color_texture, str) else base_color_texture
+            if texture_filename:
+                print(f"  🖼️  Adding texture with relative path: ./{texture_filename}")
+
+                # Create texture reader (UV texture)
+                texture_path_prim = f"{material_path}/texture"
+                texture_reader = UsdShade.Shader.Define(stage, texture_path_prim)
+                texture_reader.CreateIdAttr("UsdUVTexture")
+
+                # Set the texture file path with RELATIVE path (this is key for USDZ packaging)
+                # When USDZ is created, textures will be at root level, so "./texture_name.png" works
+                texture_reader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(f"./{texture_filename}"))
+
+                # Create ST primvar reader for UV coordinates
+                st_reader_path = f"{material_path}/stReader"
+                st_reader = UsdShade.Shader.Define(stage, st_reader_path)
+                st_reader.CreateIdAttr("UsdPrimvarReader_float2")
+                st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+
+                # Connect ST reader to texture
+                st_output = st_reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+                texture_reader.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_output)
+
+                # Get RGB output from texture
+                rgb_output = texture_reader.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+
+                # Connect texture RGB to shader diffuse color
+                shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(rgb_output)
+
+                print(f"  🔗 Connected texture to material with relative path")
+        else:
+            print(f"  ⚪ No texture available, using solid color")
+
+        # Connect shader to material
+        material_output = shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+        material.CreateSurfaceOutput().ConnectToSource(material_output)
+
+        logger.info(f"Created USD Preview Surface material '{safe_name}'")
+
+        return material_path
+
+    def bind_material_to_prim(self, stage: Usd.Stage, prim_path: str, material_path: str):
+        """
+        Bind a material to a prim.
+
+        Args:
+            stage: USD stage
+            prim_path: Path to the prim to bind material to
+            material_path: Path to the material prim
+        """
+        from pxr import UsdShade
+
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim:
+            logger.warning(f"Prim not found at {prim_path}, cannot bind material")
+            return
+
+        material = UsdShade.Material.Get(stage, material_path)
+        if not material:
+            logger.warning(f"Material not found at {material_path}")
+            return
+
+        # Bind the material to the prim
+        UsdShade.MaterialBindingAPI(prim).Bind(material)
+        logger.debug(f"Bound material {material_path} to {prim_path}")
 
     def add_mesh_prim(
         self,
@@ -126,16 +256,18 @@ class USDBuilder:
         vertices: np.ndarray,
         faces: np.ndarray,
         normals: Optional[np.ndarray] = None,
-        uvs: Optional[np.ndarray] = None,
+        uv_coords: Optional[np.ndarray] = None,
         transform: Optional[Tuple[Tuple[float, ...], ...]] = None,
-        material: Optional[ParsedMaterial] = None,
-    ) -> str:
+        material_info: Optional[Dict[str, Any]] = None,
+        model_name: str = None,
+        embed_textures: bool = False,
+        texture_files_dir: str = None
+    ) -> Tuple[str, Optional[str]]:
         """
-        Add a mesh geometry prim to the stage, optionally with material.
+        Add a mesh geometry prim to the stage.
 
         Creates an Xform parent with a Mesh child containing the geometry.
-        If a ParsedMaterial is provided, a UsdPreviewSurface material is
-        created and bound to the mesh prim.
+        Optionally creates and binds a material.
 
         Args:
             stage: USD stage
@@ -144,12 +276,17 @@ class USDBuilder:
             vertices: Nx3 array of vertex positions
             faces: Mx3 array of face indices (triangles)
             normals: Optional Nx3 array of vertex normals
+            uv_coords: Optional Nx2 array of UV texture coordinates
             transform: Optional 4x4 transform matrix
-            material: Optional ParsedMaterial to apply
+            material_info: Optional material information dict
+            model_name: Name of the model (for texture path resolution)
+            embed_textures: If True, embed texture data directly in USD
+            texture_files_dir: Directory where texture files are located
 
         Returns:
-            Path to the Xform prim containing the mesh
+            Tuple of (path to Xform prim, path to material prim or None)
         """
+        # Sanitize name for USD
         safe_name = self._sanitize_prim_name(name)
 
         # Create Xform for the part
@@ -165,10 +302,37 @@ class USDBuilder:
         mesh_path = f"{xform_path}/mesh"
         mesh = UsdGeom.Mesh.Define(stage, mesh_path)
 
-        # Set vertex positions
-        points = Vt.Vec3fArray(
-            [Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])) for v in vertices]
-        )
+        material_path = None
+
+        # Create material if provided
+        if material_info:
+            # Generate material name from mesh name if not provided
+            if hasattr(material_info, 'name'):
+                material_name = material_info.name
+            elif isinstance(material_info, dict) and 'name' in material_info:
+                material_name = material_info['name']
+            else:
+                material_name = f"{safe_name}_Material"
+            material_path = self.create_material(stage, parent_path, material_name, material_info, model_name, embed_textures, texture_files_dir)
+
+            # Bind material to Mesh prim with MaterialBindingAPI
+            from pxr import UsdShade
+            mesh_prim = mesh.GetPrim()
+
+            # Add MaterialBindingAPI schema to the Mesh
+            UsdShade.MaterialBindingAPI.Apply(mesh_prim)
+
+            # Get the material and bind it
+            material = UsdShade.Material.Get(stage, material_path)
+            if material:
+                UsdShade.MaterialBindingAPI(mesh_prim).Bind(material)
+                print(f"✅ Bound material {material_name} to Mesh {mesh_path}")
+
+        # Set vertex positions - convert numpy to native Python floats
+        points = Vt.Vec3fArray([
+            Gf.Vec3f(float(v[0]), float(v[1]), float(v[2]))
+            for v in vertices
+        ])
         mesh.CreatePointsAttr(points)
 
         # Set face vertex counts (all triangles = 3)
@@ -179,301 +343,219 @@ class USDBuilder:
         face_vertex_indices = Vt.IntArray([int(i) for i in faces.flatten()])
         mesh.CreateFaceVertexIndicesAttr(face_vertex_indices)
 
-        # Set normals if provided
+        # Set normals if provided - convert numpy to native Python floats
         if normals is not None:
-            normal_array = Vt.Vec3fArray(
-                [Gf.Vec3f(float(n[0]), float(n[1]), float(n[2])) for n in normals]
-            )
+            normal_array = Vt.Vec3fArray([
+                Gf.Vec3f(float(n[0]), float(n[1]), float(n[2]))
+                for n in normals
+            ])
             mesh.CreateNormalsAttr(normal_array)
             mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
 
-        # Set UV coordinates if provided (needed for texture mapping)
-        if uvs is not None:
-            st_array = Vt.Vec2fArray(
-                [Gf.Vec2f(float(uv[0]), float(uv[1])) for uv in uvs]
-            )
-            primvar_api = UsdGeom.PrimvarsAPI(mesh)
-            st_primvar = primvar_api.CreatePrimvar(
-                "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex
-            )
-            st_primvar.Set(st_array)
+        # Set UV coordinates if provided - convert numpy to native Python floats
+        if uv_coords is not None and len(uv_coords) > 0:
+            print(f"[DEBUG] Setting UV coordinates for mesh '{safe_name}': {len(uv_coords)} coords")
+            print(f"  Sample UVs: {uv_coords[:3]}")
+            print(f"  UV range - U: [{uv_coords[:, 0].min():.4f}, {uv_coords[:, 0].max():.4f}]")
+            print(f"  UV range - V: [{uv_coords[:, 1].min():.4f}, {uv_coords[:, 1].max():.4f}]")
 
-        # Subdivision scheme = none (render actual triangles)
+            uv_array = Vt.Vec2fArray([
+                Gf.Vec2f(float(uv[0]), float(uv[1]))
+                for uv in uv_coords
+            ])
+            # Create primvar for UV coordinates (st) - required for texture mapping
+            prim = mesh.GetPrim()
+
+            # In USD, primvars are special attributes with specific naming conventions
+            # We create "primvars:st" which is the standard way to store texture coordinates
+            try:
+                st_attr = prim.CreateAttribute("primvars:st", Sdf.ValueTypeNames.TexCoord2fArray, False)
+                st_attr.Set(uv_array)
+                # Set primvar-specific metadata for proper interpolation
+                st_attr.SetMetadata("interpolation", UsdGeom.Tokens.vertex)
+                # Note: role metadata is optional, the primvar name "primvars:st" is sufficient
+                print(f"✅ Added UV primvar (primvars:st) to mesh '{safe_name}'")
+            except Exception as e:
+                logger.warning(f"Could not create UV primvar for {safe_name}: {e}")
+                print(f"[WARNING] Failed to create UV primvar: {e}")
+
+        # Add DisplayColor primvar for proper rendering in Isaac Sim
+        # DisplayColor is a fallback for viewport when materials fail
+        # According to USD docs, DisplayColor should be used when NO MATERIAL is bound
+        # Since we're binding a material, DisplayColor might interfere
+        if not material_info:
+            # Only add DisplayColor if there's NO material
+            print(f"[DEBUG] No material, adding DisplayColor as fallback")
+            color = [0.5, 0.5, 0.5]
+            try:
+                color_array = Vt.Vec3fArray([
+                    Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))
+                    for _ in range(len(vertices))
+                ])
+                prim = mesh.GetPrim()
+                display_color_attr = prim.CreateAttribute("primvars:displayColor", Sdf.ValueTypeNames.Color3fArray, False)
+                display_color_attr.Set(color_array)
+                print(f"✅ Added DisplayColor fallback to mesh '{safe_name}'")
+            except Exception as e:
+                print(f"[WARNING] Could not create DisplayColor: {e}")
+        else:
+            print(f"[DEBUG] Material exists, not adding DisplayColor (material will provide color)")
+
+        # Set subdivision scheme to none (we want to render actual triangles)
         mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
 
-        # Apply material if provided
-        if material is not None:
-            self._apply_material(stage, mesh_path, safe_name, material)
+        logger.info(f"Added mesh '{safe_name}' with {len(vertices)} vertices, {len(faces)} faces")
 
-        logger.info(
-            f"Added mesh '{safe_name}' with {len(vertices)} vertices, "
-            f"{len(faces)} faces"
-        )
-        return xform_path
-
-    # ------------------------------------------------------------------
-    # Material application  (CRITICAL addition — fixes white-model bug)
-    # ------------------------------------------------------------------
-
-    def _apply_material(
-        self,
-        stage: Usd.Stage,
-        mesh_prim_path: str,
-        part_name: str,
-        material: ParsedMaterial,
-    ) -> None:
-        """
-        Create a UsdShade.Material with a UsdPreviewSurface shader and
-        bind it to the mesh prim.
-
-        Sets diffuseColor from baseColorFactor, metallic, roughness.
-        If a base-color texture exists, creates a UsdUVTexture node and
-        connects it to the shader's diffuseColor input.
-
-        Args:
-            stage: USD stage
-            mesh_prim_path: Path to the Mesh prim to bind the material to
-            part_name: Sanitized part name (used for material naming)
-            material: ParsedMaterial with PBR values
-        """
-        root_prim = stage.GetDefaultPrim()
-        root_path = str(root_prim.GetPath())
-
-        # Create a /Root/Materials scope
-        materials_scope_path = f"{root_path}/Materials"
-        if not stage.GetPrimAtPath(materials_scope_path).IsValid():
-            UsdGeom.Scope.Define(stage, materials_scope_path)
-
-        mat_name = self._sanitize_prim_name(f"Mat_{part_name}")
-        mat_path = f"{materials_scope_path}/{mat_name}"
-
-        # Define UsdShade.Material
-        usd_material = UsdShade.Material.Define(stage, mat_path)
-
-        # Define UsdPreviewSurface shader
-        shader_path = f"{mat_path}/PreviewSurface"
-        shader = UsdShade.Shader.Define(stage, shader_path)
-        shader.CreateIdAttr("UsdPreviewSurface")
-
-        # --- diffuseColor --------------------------------------------------------
-        r, g, b = material.base_color_factor[:3]
-
-        if material.base_color_texture_path and Path(material.base_color_texture_path).exists():
-            # Create a UsdUVTexture node connected to diffuseColor
-            tex_shader = self._create_uv_texture(
-                stage, mat_path, "BaseColorTexture", material.base_color_texture_path
-            )
-            # Connect texture output -> shader diffuseColor
-            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
-                tex_shader.ConnectableAPI(), "rgb"
-            )
-        else:
-            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-                Gf.Vec3f(float(r), float(g), float(b))
-            )
-
-        # --- opacity (from alpha channel) ----------------------------------------
-        alpha = material.base_color_factor[3] if len(material.base_color_factor) > 3 else 1.0
-        if alpha < 1.0:
-            shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(alpha))
-
-        # --- metallic / roughness ------------------------------------------------
-        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(
-            float(material.metallic_factor)
-        )
-        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(
-            float(material.roughness_factor)
-        )
-
-        # --- normal map ----------------------------------------------------------
-        if material.normal_texture_path and Path(material.normal_texture_path).exists():
-            normal_tex_shader = self._create_uv_texture(
-                stage, mat_path, "NormalTexture", material.normal_texture_path
-            )
-            shader.CreateInput("normal", Sdf.ValueTypeNames.Normal3f).ConnectToSource(
-                normal_tex_shader.ConnectableAPI(), "rgb"
-            )
-
-        # Connect shader surface output -> material surface
-        shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
-        usd_material.CreateSurfaceOutput().ConnectToSource(
-            shader.ConnectableAPI(), "surface"
-        )
-
-        # Bind material to the mesh prim
-        mesh_prim = stage.GetPrimAtPath(mesh_prim_path)
-        if mesh_prim.IsValid():
-            UsdShade.MaterialBindingAPI.Apply(mesh_prim).Bind(usd_material)
-
-        logger.info(
-            f"Applied material '{mat_name}' to {mesh_prim_path} "
-            f"(diffuse=[{r:.2f},{g:.2f},{b:.2f}], "
-            f"metallic={material.metallic_factor}, "
-            f"roughness={material.roughness_factor})"
-        )
-
-    def _create_uv_texture(
-        self,
-        stage: Usd.Stage,
-        mat_path: str,
-        tex_name: str,
-        texture_file_path: str,
-    ) -> UsdShade.Shader:
-        """
-        Create a UsdUVTexture shader node that references a file texture.
-
-        Args:
-            stage: USD stage
-            mat_path: Parent material prim path
-            tex_name: Name for the texture shader prim
-            texture_file_path: Absolute path to the PNG texture file
-
-        Returns:
-            The UsdShade.Shader for the texture node
-        """
-        tex_shader_path = f"{mat_path}/{self._sanitize_prim_name(tex_name)}"
-        tex_shader = UsdShade.Shader.Define(stage, tex_shader_path)
-        tex_shader.CreateIdAttr("UsdUVTexture")
-
-        # Set file path (relative to USDA output directory for correct resolution)
-        rel_path = os.path.relpath(texture_file_path, str(self.output_dir))
-        tex_shader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
-            Sdf.AssetPath(rel_path)
-        )
-
-        # Set default wrap modes
-        tex_shader.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
-        tex_shader.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("repeat")
-
-        # Create output
-        tex_shader.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
-        tex_shader.CreateOutput("a", Sdf.ValueTypeNames.Float)
-
-        # Create a primvar reader for UVs (st)
-        st_reader_path = f"{mat_path}/PrimvarReader_st"
-        if not stage.GetPrimAtPath(st_reader_path).IsValid():
-            st_reader = UsdShade.Shader.Define(stage, st_reader_path)
-            st_reader.CreateIdAttr("UsdPrimvarReader_float2")
-            st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
-            st_reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
-        else:
-            st_reader = UsdShade.Shader(stage.GetPrimAtPath(st_reader_path))
-
-        # Connect st reader -> texture st input
-        tex_shader.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
-            st_reader.ConnectableAPI(), "result"
-        )
-
-        return tex_shader
-
-    # ------------------------------------------------------------------
-    # Build from parts
-    # ------------------------------------------------------------------
-
+        return xform_path, material_path
+    
     def build_from_parts(
         self,
         filename: str,
         model_name: str,
         mesh_data: Dict[str, Dict[str, Any]],
         part_info: List[Dict[str, Any]],
+        embed_textures: bool = False,
+        texture_files_dir: str = None
     ) -> Tuple[Usd.Stage, Dict[str, str]]:
         """
         Build a complete USD stage from parsed mesh data.
 
-        Creates the stage, adds all meshes (with materials) as prims,
-        and returns a mapping from part IDs to their USD prim paths.
+        Creates the stage, adds all meshes as prims, and returns
+        a mapping from part IDs to their USD prim paths.
 
         Args:
             filename: Output USD filename
             model_name: Name for the root prim
-            mesh_data: Dict mapping part_id to
-                       {vertices, faces, normals, material}
+            mesh_data: Dict mapping part_id to {vertices, faces, normals}
             part_info: List of part dicts with id and type info
+            embed_textures: If True, embed texture data directly in USD file
+            texture_files_dir: Directory where texture files are located
 
         Returns:
             Tuple of (stage, part_id_to_path mapping)
         """
-        stage = self.create_stage(filename, model_name)
+        # Create stage with Z-up axis (Isaac Sim convention)
+        stage = self.create_stage(filename, model_name, up_axis="Z")
         root_prim = stage.GetDefaultPrim()
         root_path = str(root_prim.GetPath())
 
         # Add physics scene
         self.add_physics_scene(stage)
 
-        part_paths: Dict[str, str] = {}
-        part_info_map = {p["id"]: p for p in part_info}
+        # Track part paths
+        part_paths = {}
 
+        # Create part info lookup
+        part_info_map = {p['id']: p for p in part_info}
+
+        # Add each mesh as a prim
         for part_id, data in mesh_data.items():
-            info = part_info_map.get(part_id, {"type": "link"})
-            part_name = info.get("name", part_id)
+            # Get part metadata if available
+            info = part_info_map.get(part_id, {'type': 'link'})
+            part_name = info.get('name', part_id)
 
-            # Extract material (ParsedMaterial or None)
-            material = data.get("material")
+            # Extract material info from mesh data
+            material_info = data.get('material')
 
             # Transform from Y-up (GLB) to Z-up (USD/Isaac Sim)
-            # Rotation 90° around X: x' = x, y' = -z, z' = y
-            verts = data["vertices"]
+            # Rotation 90 deg around X: x' = x, y' = -z, z' = y
+            import numpy as np
+            verts = data['vertices']
             verts_zup = np.column_stack([verts[:, 0], -verts[:, 2], verts[:, 1]])
 
-            normals = data.get("normals")
-            if normals is not None:
-                normals = np.column_stack([normals[:, 0], -normals[:, 2], normals[:, 1]])
+            normals_data = data.get('normals')
+            if normals_data is not None:
+                normals_data = np.column_stack([normals_data[:, 0], -normals_data[:, 2], normals_data[:, 1]])
 
-            prim_path = self.add_mesh_prim(
+            # Add the mesh
+            prim_path, material_path = self.add_mesh_prim(
                 stage=stage,
                 parent_path=root_path,
                 name=part_name,
                 vertices=verts_zup,
-                faces=data["faces"],
-                normals=normals,
-                uvs=data.get("uvs"),
-                material=material,
+                faces=data['faces'],
+                normals=normals_data,
+                uv_coords=data.get('uv_coords'),
+                material_info=material_info,
+                model_name=model_name,
+                embed_textures=embed_textures,
+                texture_files_dir=texture_files_dir
             )
 
             part_paths[part_id] = prim_path
 
         logger.info(f"Built USD stage with {len(part_paths)} parts")
+
         return stage, part_paths
-
-    # ------------------------------------------------------------------
-    # Save
-    # ------------------------------------------------------------------
-
+    
     def save_stage(self, stage: Usd.Stage) -> str:
         """
         Save the USD stage to disk.
 
+        Args:
+            stage: USD stage to save
+
         Returns:
             Path to saved file
         """
+        # Check if DisplayColor exists before saving
+        print(f"\n[SAVE-CHECK] Root layer: {stage.GetRootLayer().identifier}")
+        for prim in stage.Traverse():
+            if prim.IsA(UsdGeom.Mesh):
+                dc_attr = prim.GetAttribute("primvars:displayColor")
+                if dc_attr.IsValid():
+                    dc_data = dc_attr.Get()
+                    print(f"[SAVE-CHECK] Mesh {prim.GetPath()}: DisplayColor has {len(dc_data) if dc_data else 0} values")
+                else:
+                    print(f"[SAVE-CHECK] Mesh {prim.GetPath()}: NO DisplayColor")
+
+        # Export to string to verify content
+        print("\n[SAVE-CHECK] Exporting stage to string to verify content...")
+        exported = stage.GetRootLayer().ExportToString()
+        # Check for displayColor (lowercase d as USD exports it)
+        if 'displayColor' in exported or 'primvars:displayColor' in exported:
+            print("✅ DisplayColor found in exported content!")
+            # Show the line
+            for line in exported.split('\n'):
+                if 'displayColor' in line.lower():
+                    print(f"  Found: {line.strip()}")
+        else:
+            print("❌ DisplayColor NOT found in exported content")
+
         stage.GetRootLayer().Save()
         filepath = stage.GetRootLayer().realPath
         logger.info(f"Saved USD stage: {filepath}")
         return filepath
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
+    
     def _sanitize_prim_name(self, name: str) -> str:
         """
         Sanitize a name for use as a USD prim name.
-
+        
         USD prim names must:
         - Start with a letter or underscore
         - Contain only letters, numbers, and underscores
+        
+        Args:
+            name: Raw name
+            
+        Returns:
+            Sanitized prim name
         """
-        sanitized = "".join(c if c.isalnum() or c == "_" else "_" for c in name)
-
+        # Replace invalid characters with underscore
+        sanitized = ''.join(c if c.isalnum() or c == '_' else '_' for c in name)
+        
+        # Ensure starts with letter or underscore
         if sanitized and sanitized[0].isdigit():
-            sanitized = "_" + sanitized
-
+            sanitized = '_' + sanitized
+        
+        # Handle empty string
         if not sanitized:
-            sanitized = "_unnamed"
-
-        while "__" in sanitized:
-            sanitized = sanitized.replace("__", "_")
-
+            sanitized = '_unnamed'
+        
+        # Remove consecutive underscores
+        while '__' in sanitized:
+            sanitized = sanitized.replace('__', '_')
+        
         return sanitized
 
 
