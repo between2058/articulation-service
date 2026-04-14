@@ -30,9 +30,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application source
-COPY models/        /app/models/
-COPY services/      /app/services/
-COPY articulation_api.py /app/articulation_api.py
+COPY app/ /app/app/
 
 # Create runtime directories
 RUN mkdir -p /app/outputs /app/outputs/textures /app/uploads /app/logs
@@ -44,9 +42,9 @@ HEALTHCHECK \
     --timeout=10s \
     --start-period=30s \
     --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:52071/health')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:52071/api/health')" || exit 1
 
-CMD ["python", "-m", "uvicorn", "articulation_api:app", \
+CMD ["python", "-m", "uvicorn", "app.main:app", \
      "--host", "0.0.0.0", \
      "--port", "52071", \
      "--workers", "1", \
