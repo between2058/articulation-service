@@ -2,10 +2,13 @@
 API Routes for Phidias Articulation MVP
 
 Endpoints:
-- POST /upload: Upload GLB file, parse and return parts list
-- POST /export: Generate USD from articulation data
+- POST /parse-glb: Upload GLB file, parse and return parts list
+- POST /export-usda: Generate USDA from articulation data
+- POST /export-usdz: Generate USDZ from articulation data
+- POST /debug-glb: Diagnostic report of pipeline stages
 - GET /download/{filename}: Download generated USD files
 - GET /models/{filename}: Serve uploaded GLB files for frontend viewer
+- GET /health: Health check
 """
 
 import os
@@ -42,8 +45,8 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-@router.post("/upload", response_model=UploadResponse)
-async def upload_glb(file: UploadFile = File(...)):
+@router.post("/parse-glb", response_model=UploadResponse)
+async def parse_glb(file: UploadFile = File(...)):
     """
     Upload a GLB file and parse its mesh structure.
     
