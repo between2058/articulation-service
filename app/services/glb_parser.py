@@ -320,12 +320,37 @@ class GLBParser:
                     if uri_ext in ['.jpg', '.jpeg', '.png', '.webp']:
                         ext = uri_ext
 
-                # Save texture file
-                texture_filename = f"texture_{i}{ext}"
-                texture_path = texture_dir / texture_filename
-
-                with open(texture_path, 'wb') as img_file:
-                    img_file.write(image_data)
+                # Save texture file.
+                # WebP is not ARKit-conformant and most USD renderers
+                # (Hydra Storm, Blender, Isaac Sim) cannot decode it, so
+                # convert to PNG during extraction. PNG/JPEG are kept as-is.
+                if ext == '.webp':
+                    try:
+                        img = Image.open(BytesIO(image_data))
+                        if img.mode not in ('RGB', 'RGBA'):
+                            img = img.convert('RGBA' if 'A' in img.mode else 'RGB')
+                        texture_filename = f"texture_{i}.png"
+                        texture_path = texture_dir / texture_filename
+                        img.save(texture_path, format='PNG')
+                        with open(texture_path, 'rb') as f:
+                            image_data = f.read()
+                        logger.info(
+                            f"Converted WebP texture {i} to PNG "
+                            f"({texture_filename}, {len(image_data)} bytes)"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to convert WebP texture {i}, keeping raw: {e}"
+                        )
+                        texture_filename = f"texture_{i}{ext}"
+                        texture_path = texture_dir / texture_filename
+                        with open(texture_path, 'wb') as img_file:
+                            img_file.write(image_data)
+                else:
+                    texture_filename = f"texture_{i}{ext}"
+                    texture_path = texture_dir / texture_filename
+                    with open(texture_path, 'wb') as img_file:
+                        img_file.write(image_data)
 
                 extracted_textures[i] = texture_filename
                 extracted_data[i] = image_data  # Store raw data
