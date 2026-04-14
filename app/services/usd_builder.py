@@ -154,66 +154,143 @@ class USDBuilder:
         material_path = f"{looks_path}/{safe_name}"
         material = UsdShade.Material.Define(stage, material_path)
 
-        # Handle different material info formats (dict vs MaterialInfo)
-        if hasattr(material_info, 'diffuse_color'):
-            # MaterialInfo object
-            diffuse_color = material_info.diffuse_color
-            metallic = material_info.metallic
-            roughness = material_info.roughness
-            has_base_color_texture = material_info.has_base_color_texture
-            base_color_texture = material_info.base_color_texture
-        else:
-            # Dict format (backward compatibility)
-            diffuse_color = material_info.get('diffuse_color', [0.8, 0.8, 0.8])
-            metallic = material_info.get('metallic', 0.0)
-            roughness = material_info.get('roughness', 0.5)
-            has_base_color_texture = material_info.get('has_base_color_texture', False)
-            base_color_texture = material_info.get('base_color_texture')
+        # Extract fields from MaterialInfo object or dict
+        def _mi_get(key, default=None):
+            if hasattr(material_info, key):
+                return getattr(material_info, key)
+            if isinstance(material_info, dict):
+                return material_info.get(key, default)
+            return default
+
+        def _tex_filename(texture):
+            """MaterialInfo textures can be a TextureInfo object or a plain string."""
+            if texture is None:
+                return None
+            if isinstance(texture, str):
+                return texture
+            return getattr(texture, 'filename', None)
+
+        diffuse_color = _mi_get('diffuse_color', [0.8, 0.8, 0.8])
+        metallic_factor = float(_mi_get('metallic', 0.0) or 0.0)
+        roughness_factor = float(_mi_get('roughness', 0.5) or 0.5)
+        emissive_factor = _mi_get('emissive_factor', (0.0, 0.0, 0.0)) or (0.0, 0.0, 0.0)
+
+        base_color_tex = _tex_filename(_mi_get('base_color_texture')) if _mi_get('has_base_color_texture') else None
+        mr_tex         = _tex_filename(_mi_get('metallic_roughness_texture')) if _mi_get('has_metallic_roughness_texture') else None
+        normal_tex     = _tex_filename(_mi_get('normal_texture')) if _mi_get('has_normal_texture') else None
+        occlusion_tex  = _tex_filename(_mi_get('occlusion_texture')) if _mi_get('has_occlusion_texture') else None
+        emissive_tex   = _tex_filename(_mi_get('emissive_texture')) if _mi_get('has_emissive_texture') else None
 
         # Create preview surface shader (simpler and more compatible than MDL)
         shader_path = f"{material_path}/shader"
         shader = UsdShade.Shader.Define(stage, shader_path)
         shader.CreateIdAttr("UsdPreviewSurface")
 
-        # Set basic material properties
-        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(diffuse_color[0], diffuse_color[1], diffuse_color[2]))
-        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(float(roughness))
-        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(float(metallic))
+        # Scalar factor fallbacks (overridden by connections below if textures exist)
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+            Gf.Vec3f(float(diffuse_color[0]), float(diffuse_color[1]), float(diffuse_color[2]))
+        )
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(metallic_factor)
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(roughness_factor)
+        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(
+            Gf.Vec3f(float(emissive_factor[0]), float(emissive_factor[1]), float(emissive_factor[2]))
+        )
 
-        # If we have a texture, create texture node and connect it with RELATIVE path
-        if has_base_color_texture and base_color_texture:
-            texture_filename = getattr(base_color_texture, 'filename', base_color_texture) if not isinstance(base_color_texture, str) else base_color_texture
-            if texture_filename:
-                print(f"  🖼️  Adding texture with relative path: ./{texture_filename}")
+        # Lazy-create a single shared UV reader for st primvar (all textures sample the same UVs)
+        st_reader_cache = {}
 
-                # Create texture reader (UV texture)
-                texture_path_prim = f"{material_path}/texture"
-                texture_reader = UsdShade.Shader.Define(stage, texture_path_prim)
-                texture_reader.CreateIdAttr("UsdUVTexture")
+        def _ensure_st_reader():
+            if 'reader' in st_reader_cache:
+                return st_reader_cache['output']
+            st_reader_path = f"{material_path}/stReader"
+            st_reader = UsdShade.Shader.Define(stage, st_reader_path)
+            st_reader.CreateIdAttr("UsdPrimvarReader_float2")
+            st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+            st_output = st_reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+            st_reader_cache['reader'] = st_reader
+            st_reader_cache['output'] = st_output
+            return st_output
 
-                # Set the texture file path with RELATIVE path (this is key for USDZ packaging)
-                # When USDZ is created, textures will be at root level, so "./texture_name.png" works
-                texture_reader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(f"./{texture_filename}"))
+        def _make_uv_texture(prim_name, filename, color_space="auto",
+                             scale=None, bias=None):
+            """Create a UsdUVTexture sampling the shared st reader.
 
-                # Create ST primvar reader for UV coordinates
-                st_reader_path = f"{material_path}/stReader"
-                st_reader = UsdShade.Shader.Define(stage, st_reader_path)
-                st_reader.CreateIdAttr("UsdPrimvarReader_float2")
-                st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+            color_space: "sRGB" for base color / emissive, "raw" for data maps
+                         (metallic-roughness, normal, occlusion).
+            scale/bias: optional 4-tuples for normal maps ([0,1] -> [-1,1]).
+            """
+            tex_path = f"{material_path}/{prim_name}"
+            tex = UsdShade.Shader.Define(stage, tex_path)
+            tex.CreateIdAttr("UsdUVTexture")
+            tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
+                Sdf.AssetPath(f"./{filename}")
+            )
+            tex.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set(color_space)
+            tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(_ensure_st_reader())
+            if scale is not None:
+                tex.CreateInput("scale", Sdf.ValueTypeNames.Float4).Set(Gf.Vec4f(*scale))
+            if bias is not None:
+                tex.CreateInput("bias", Sdf.ValueTypeNames.Float4).Set(Gf.Vec4f(*bias))
+            return tex
 
-                # Connect ST reader to texture
-                st_output = st_reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
-                texture_reader.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_output)
+        any_texture = False
 
-                # Get RGB output from texture
-                rgb_output = texture_reader.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+        # Base color texture → diffuseColor (sRGB)
+        if base_color_tex:
+            print(f"  🖼️  base color texture: ./{base_color_tex}")
+            tex = _make_uv_texture("baseColorTexture", base_color_tex, color_space="sRGB")
+            rgb_out = tex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(rgb_out)
+            any_texture = True
 
-                # Connect texture RGB to shader diffuse color
-                shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(rgb_output)
+        # Metallic-roughness texture (GLTF packs: B=metallic, G=roughness, R=occlusion)
+        if mr_tex:
+            print(f"  🖼️  metallic/roughness texture: ./{mr_tex}")
+            tex = _make_uv_texture("metallicRoughnessTexture", mr_tex, color_space="raw")
+            g_out = tex.CreateOutput("g", Sdf.ValueTypeNames.Float)
+            b_out = tex.CreateOutput("b", Sdf.ValueTypeNames.Float)
+            shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).ConnectToSource(g_out)
+            shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).ConnectToSource(b_out)
+            any_texture = True
 
-                print(f"  🔗 Connected texture to material with relative path")
-        else:
-            print(f"  ⚪ No texture available, using solid color")
+        # Normal map → normal (tangent-space, scale [0,1] → [-1,1])
+        if normal_tex:
+            print(f"  🖼️  normal texture: ./{normal_tex}")
+            tex = _make_uv_texture(
+                "normalTexture", normal_tex,
+                color_space="raw",
+                scale=(2.0, 2.0, 2.0, 1.0),
+                bias=(-1.0, -1.0, -1.0, 0.0),
+            )
+            rgb_out = tex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+            shader.CreateInput("normal", Sdf.ValueTypeNames.Normal3f).ConnectToSource(rgb_out)
+            any_texture = True
+
+        # Occlusion texture (GLTF stores AO in R channel; emissive and occlusion can
+        # share a texture with MR but per-channel connection still works)
+        if occlusion_tex:
+            print(f"  🖼️  occlusion texture: ./{occlusion_tex}")
+            # Reuse MR texture node if occlusion is the same file (GLTF ORM packing)
+            if occlusion_tex == mr_tex:
+                # Shader node for occlusion share was created above; just wire R channel
+                mr_tex_prim = stage.GetPrimAtPath(f"{material_path}/metallicRoughnessTexture")
+                tex = UsdShade.Shader(mr_tex_prim)
+            else:
+                tex = _make_uv_texture("occlusionTexture", occlusion_tex, color_space="raw")
+            r_out = tex.CreateOutput("r", Sdf.ValueTypeNames.Float)
+            shader.CreateInput("occlusion", Sdf.ValueTypeNames.Float).ConnectToSource(r_out)
+            any_texture = True
+
+        # Emissive texture → emissiveColor (sRGB)
+        if emissive_tex:
+            print(f"  🖼️  emissive texture: ./{emissive_tex}")
+            tex = _make_uv_texture("emissiveTexture", emissive_tex, color_space="sRGB")
+            rgb_out = tex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+            shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(rgb_out)
+            any_texture = True
+
+        if not any_texture:
+            print(f"  ⚪ No textures available, using solid color + scalar factors")
 
         # Connect shader to material
         material_output = shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
