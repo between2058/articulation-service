@@ -11,21 +11,20 @@ Endpoints:
 - GET /health: Health check
 """
 
+import json
 import os
 import uuid
 import logging
 from pathlib import Path
 from typing import List
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 
 from app.models.schemas import (
     UploadResponse,
-    ExportRequest,
     ExportResponse,
-    Part,
-    ArticulationData
+    ArticulationData,
 )
 from app.services.glb_parser import glb_parser
 from app.services.usd_builder import usd_builder
@@ -104,33 +103,24 @@ async def parse_glb(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
-@router.post("/export", response_model=ExportResponse)
-async def export_usd(request: ExportRequest):
+async def _do_export(
+    glb_path: Path,
+    glb_filename: str,
+    articulation: ArticulationData,
+    output_format: str,
+) -> ExportResponse:
     """
-    Export articulation data to a physics-enabled USD/USDZ file.
+    Shared export pipeline: mesh extraction → material/texture → USD stage
+    → physics schemas → USDA on disk → optional USDZ packaging.
 
-    Takes the GLB filename and articulation data (parts + joints),
-    converts to USD with proper physics schemas for Isaac Sim.
-    Optionally packages into USDZ format with embedded textures.
-
-    Args:
-        request: Export request with GLB filename, articulation data, and output format
-
-    Returns:
-        ExportResponse with download URL for the generated file
+    Body lifted from editor's original /export handler. Substitutions:
+    request.articulation.* → articulation.* ; request.output_format →
+    output_format ; request.glb_filename → glb_filename. The caller has
+    already written the GLB to glb_path.
     """
-    glb_path = UPLOAD_DIR / request.glb_filename
-
-    if not glb_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"GLB file not found: {request.glb_filename}"
-        )
-
     try:
         # Generate output filename based on format
-        base_name = request.articulation.model_name or "robot"
-        output_format = request.output_format or "usda"
+        base_name = articulation.model_name or "robot"
 
         if output_format == "usdz":
             output_filename = f"{base_name}_{str(uuid.uuid4())[:8]}.usdz"
@@ -155,14 +145,14 @@ async def export_usd(request: ExportRequest):
                 'role': part.role,
                 'mobility': part.mobility
             }
-            for part in request.articulation.parts
+            for part in articulation.parts
         ]
 
         # Build USD stage with meshes
         usda_filename = output_filename.replace('.usdz', '.usda')
 
         # Extract textures to separate files (not embedded)
-        glb_name = Path(request.glb_filename).stem
+        glb_name = Path(glb_filename).stem
         texture_dir = OUTPUT_DIR / glb_name
         texture_files = []
         texture_mapping = {}
@@ -171,14 +161,10 @@ async def export_usd(request: ExportRequest):
         try:
             extracted_textures, extracted_data = glb_parser.extract_textures(str(glb_path), glb_name)
             if extracted_textures:
-                # Get list of extracted texture files
                 texture_files = [str(texture_dir / fname) for fname in extracted_textures.values()]
 
-                # Create mapping: old path -> new name (texture0.png, etc.)
-                # For USDZ packaging, textures should be at the root of the archive with simple names
                 for idx, fname in enumerate(extracted_textures.values()):
                     old_path = str(texture_dir / fname)
-                    # Use simple sequential names for USDZ compatibility
                     new_name = f"texture_{idx}{Path(fname).suffix}"
                     texture_mapping[old_path] = new_name
                     print(f"[INFO] Texture mapping: {fname} -> {new_name}")
@@ -188,43 +174,34 @@ async def export_usd(request: ExportRequest):
             print(f"[WARNING] Could not extract textures: {e}")
 
         # Build USD stage (textures will be referenced externally, not embedded)
-        embed_textures = False  # Never embed textures - always reference externally
+        embed_textures = False
 
         # Update mesh data to use mapped texture names if USDZ
         if output_format == "usdz" and texture_mapping:
-            # Update material info in mesh_data to use mapped texture names
-            # For USDZ, we need to ensure the texture references match what will be in the archive
             for part_id, data in mesh_data.items():
                 if 'material' in data:
                     material = data['material']
-                    # Handle base color texture - check if it's a MaterialInfo object or dict
                     if hasattr(material, 'has_base_color_texture') and material.has_base_color_texture and material.base_color_texture:
-                        # MaterialInfo object
                         base_color_texture = material.base_color_texture
                         if hasattr(base_color_texture, 'filename') and base_color_texture.filename:
                             old_texture_name = base_color_texture.filename
-                            # Try to find the full path in mapping
                             for old_path, new_name in texture_mapping.items():
                                 if old_texture_name and old_texture_name in old_path:
                                     base_color_texture.filename = new_name
                                     print(f"[DEBUG] Updated base color texture reference for USDZ: {old_texture_name} -> {new_name}")
                                     break
                     elif isinstance(material, dict) and material.get('has_base_color_texture') and material.get('base_color_texture'):
-                        # Dict format (backward compatibility)
                         base_color_texture = material['base_color_texture']
                         if isinstance(base_color_texture, dict) and 'filename' in base_color_texture:
                             old_texture_name = base_color_texture['filename']
-                            # Try to find the full path in mapping
                             for old_path, new_name in texture_mapping.items():
                                 if old_texture_name and old_texture_name in old_path:
                                     material['base_color_texture']['filename'] = new_name
                                     print(f"[DEBUG] Updated base color texture reference for USDZ: {old_texture_name} -> {new_name}")
                                     break
 
-                    # Handle other texture channels if they exist
                     texture_channels = ['metallic_roughness_texture', 'normal_texture', 'occlusion_texture', 'emissive_texture']
                     for channel in texture_channels:
-                        # Check MaterialInfo object format
                         attr_name = f'has_{channel}'
                         texture_attr = channel
                         if hasattr(material, attr_name) and getattr(material, attr_name) and hasattr(material, texture_attr):
@@ -232,19 +209,16 @@ async def export_usd(request: ExportRequest):
                             if texture_info and hasattr(texture_info, 'filename') and texture_info.filename:
                                 old_texture_name = texture_info.filename
                                 if old_texture_name:
-                                    # Try to find the full path in mapping
                                     for old_path, new_name in texture_mapping.items():
                                         if old_texture_name in old_path:
                                             texture_info.filename = new_name
                                             print(f"[DEBUG] Updated {channel} reference for USDZ: {old_texture_name} -> {new_name}")
                                             break
-                        # Check dict format (backward compatibility)
                         elif isinstance(material, dict) and material.get(f'has_{channel}') and material.get(channel):
                             texture_info = material[channel]
                             if isinstance(texture_info, dict) and 'filename' in texture_info:
                                 old_texture_name = texture_info['filename']
                                 if old_texture_name:
-                                    # Try to find the full path in mapping
                                     for old_path, new_name in texture_mapping.items():
                                         if old_texture_name in old_path:
                                             material[channel]['filename'] = new_name
@@ -253,7 +227,7 @@ async def export_usd(request: ExportRequest):
 
         stage, part_paths = usd_builder.build_from_parts(
             filename=usda_filename,
-            model_name=request.articulation.model_name,
+            model_name=articulation.model_name,
             mesh_data=mesh_data,
             part_info=part_info,
             embed_textures=embed_textures,
@@ -263,34 +237,32 @@ async def export_usd(request: ExportRequest):
         # Inject physics schemas
         physics_injector.inject_physics(
             stage=stage,
-            articulation_data=request.articulation,
+            articulation_data=articulation,
             part_paths=part_paths
         )
 
         # Save the USD stage
         usd_path = usd_builder.save_stage(stage)
 
-        # Enhanced validation (optional)
+        # Enhanced validation (optional — script lives only in editor repo;
+        # import will fail silently in this service, which is fine)
         try:
             from scripts.validate_usd import validate_physics_usd
             validation_results = validate_physics_usd(usd_path)
             if not validation_results["valid"]:
                 logger.warning(f"Validation failed for {usd_path}: {validation_results['errors']}")
-                # Continue with export but log the issues
             else:
                 logger.info(f"Validation passed for {usd_path}")
         except Exception as e:
             logger.warning(f"Validation skipped due to error: {e}")
 
-        # Copy texture files to the same directory as the USD file for both USDA and USDZ
-        # This ensures relative paths in the USD file work correctly
+        # Copy texture files to USD directory (same behavior as editor)
+        copied_textures = []
         if texture_files and texture_mapping:
             from shutil import copy2
             usd_dir = Path(usd_path).parent
             print(f"[INFO] Copying {len(texture_files)} textures to USD directory: {usd_dir}")
 
-            # Copy each texture file to the USD directory with its mapped name
-            copied_textures = []
             for old_path, new_name in texture_mapping.items():
                 dest_path = usd_dir / new_name
                 try:
@@ -300,10 +272,9 @@ async def export_usd(request: ExportRequest):
                 except Exception as e:
                     print(f"[WARNING] Failed to copy texture {old_path} -> {dest_path}: {e}")
 
-        # If USDZ requested, package it with textures
+        # If USDZ requested, package it
         final_output_path = usd_path
         if output_format == "usdz":
-            # Package USD + textures into USDZ using USD's built-in utility
             usdz_path = usdz_packager.create_usdz(
                 usd_file_path=usd_path,
                 texture_files=texture_files if texture_files else None,
@@ -311,10 +282,8 @@ async def export_usd(request: ExportRequest):
                 output_filename=output_filename
             )
 
-            # Remove the temporary USD file and copied textures since we now have USDZ
             try:
                 Path(usd_path).unlink()
-                # Clean up copied texture files
                 for texture_path in copied_textures:
                     if texture_path.exists():
                         texture_path.unlink()
@@ -323,12 +292,10 @@ async def export_usd(request: ExportRequest):
                 print(f"[WARNING] Failed to clean up temporary files: {e}")
 
             final_output_path = usdz_path
-
             logger.info(f"Exported USDZ: {final_output_path}")
         else:
             logger.info(f"Exported USD: {final_output_path}")
 
-        # Construct download URL
         download_url = f"/api/download/{Path(final_output_path).name}"
 
         return ExportResponse(
@@ -339,12 +306,66 @@ async def export_usd(request: ExportRequest):
             format=output_format
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Export failed: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Export failed: {str(e)}"
         )
+
+
+async def _save_and_export(
+    file: UploadFile,
+    articulation: str,
+    output_format: str,
+) -> ExportResponse:
+    """
+    Save the uploaded GLB to UPLOAD_DIR, parse the articulation JSON, then
+    delegate to _do_export.
+    """
+    if not file.filename.lower().endswith(".glb"):
+        raise HTTPException(status_code=400, detail="Only .glb files are supported")
+
+    unique_id = str(uuid.uuid4())[:8]
+    safe_filename = f"{unique_id}_{file.filename}"
+    glb_path = UPLOAD_DIR / safe_filename
+
+    content = await file.read()
+    with open(glb_path, "wb") as f:
+        f.write(content)
+    logger.info(f"Saved uploaded file for export: {glb_path} ({len(content)} bytes)")
+
+    try:
+        art_payload = json.loads(articulation)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid articulation JSON: {e}")
+
+    try:
+        art_data = ArticulationData(**art_payload)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Articulation schema error: {e}")
+
+    return await _do_export(glb_path, safe_filename, art_data, output_format)
+
+
+@router.post("/export-usda", response_model=ExportResponse)
+async def export_usda(
+    file: UploadFile = File(...),
+    articulation: str = Form(...),
+):
+    """Export articulation data to a USDA file. Multipart form-data."""
+    return await _save_and_export(file, articulation, "usda")
+
+
+@router.post("/export-usdz", response_model=ExportResponse)
+async def export_usdz(
+    file: UploadFile = File(...),
+    articulation: str = Form(...),
+):
+    """Export articulation data to a USDZ file. Multipart form-data."""
+    return await _save_and_export(file, articulation, "usdz")
 
 
 @router.get("/download/{filename}")
