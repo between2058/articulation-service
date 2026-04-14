@@ -104,9 +104,8 @@ class USDBuilder:
         # Define physics scene
         physics_scene = UsdPhysics.Scene.Define(stage, scene_path)
         
-        # Set gravity for Y-up axis (gravity points down in Y direction)
-        # So gravity should be (0, -1, 0) for Y-up stages with magnitude 9.81
-        physics_scene.CreateGravityDirectionAttr(Gf.Vec3f(0, -1, 0))
+        # Set gravity for Z-up axis (Isaac Sim convention)
+        physics_scene.CreateGravityDirectionAttr(Gf.Vec3f(0, 0, -1))
         physics_scene.CreateGravityMagnitudeAttr(9.81)
         
         logger.info(f"Added PhysicsScene at {scene_path}")
@@ -435,8 +434,8 @@ class USDBuilder:
         Returns:
             Tuple of (stage, part_id_to_path mapping)
         """
-        # Create stage with Y-up axis as requested
-        stage = self.create_stage(filename, model_name, up_axis="Y")
+        # Create stage with Z-up axis (Isaac Sim convention)
+        stage = self.create_stage(filename, model_name, up_axis="Z")
         root_prim = stage.GetDefaultPrim()
         root_path = str(root_prim.GetPath())
 
@@ -458,14 +457,26 @@ class USDBuilder:
             # Extract material info from mesh data
             material_info = data.get('material')
 
+            # Transform from Y-up (GLB) to Z-up (USD/Isaac Sim)
+            # Rotation 90 deg around X: x' = x, y' = -z, z' = y
+            import numpy as np
+            verts = data['vertices']
+            verts_zup = np.column_stack([verts[:, 0], -verts[:, 2], verts[:, 1]])
+
+            normals_data = data.get('normals')
+            if normals_data is not None:
+                normals_data = np.column_stack(
+                    [normals_data[:, 0], -normals_data[:, 2], normals_data[:, 1]]
+                )
+
             # Add the mesh
             prim_path, material_path = self.add_mesh_prim(
                 stage=stage,
                 parent_path=root_path,
                 name=part_name,
-                vertices=data['vertices'],
+                vertices=verts_zup,
                 faces=data['faces'],
-                normals=data.get('normals'),
+                normals=normals_data,
                 uv_coords=data.get('uv_coords'),
                 material_info=material_info,
                 model_name=model_name,
