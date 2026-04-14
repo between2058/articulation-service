@@ -325,7 +325,7 @@ async def _save_and_export(
     Save the uploaded GLB to UPLOAD_DIR, parse the articulation JSON, then
     delegate to _do_export.
     """
-    if not file.filename.lower().endswith(".glb"):
+    if not file.filename or not file.filename.lower().endswith(".glb"):
         raise HTTPException(status_code=400, detail="Only .glb files are supported")
 
     unique_id = str(uuid.uuid4())[:8]
@@ -347,7 +347,11 @@ async def _save_and_export(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Articulation schema error: {e}")
 
-    return await _do_export(glb_path, safe_filename, art_data, output_format)
+    try:
+        return await _do_export(glb_path, safe_filename, art_data, output_format)
+    finally:
+        if glb_path.exists():
+            glb_path.unlink()
 
 
 @router.post("/export-usda", response_model=ExportResponse)
