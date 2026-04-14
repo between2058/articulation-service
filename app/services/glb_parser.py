@@ -129,6 +129,24 @@ class GLBParser:
             logger.warning(f"Failed to separate texture channels: {e}")
             return {}
 
+    def _resolve_texture_source(self, gltf_texture: Dict[str, Any]) -> Optional[int]:
+        """
+        Return the image index that a GLTF texture should resolve to.
+
+        Prefers the EXT_texture_webp extension's source (for TRELLIS.2 and
+        other WebP-only outputs that omit the top-level fallback), then
+        falls back to the standard GLTF `source`.
+
+        Returns None if neither is available.
+        """
+        extensions = gltf_texture.get('extensions') or {}
+        webp = extensions.get('EXT_texture_webp') or {}
+        if 'source' in webp:
+            return webp['source']
+        if 'source' in gltf_texture:
+            return gltf_texture['source']
+        return None
+
     def _extract_texture_transform(self, texture_info: Dict[str, Any]) -> Tuple[Tuple[float, float], Tuple[float, float], float]:
         """
         Extract texture transform information from KHR_texture_transform extension.
@@ -464,8 +482,8 @@ class GLBParser:
             texture_index = base_color_texture['index']
             if 'textures' in gltf and texture_index < len(gltf['textures']):
                 gltf_texture = gltf['textures'][texture_index]
-                if 'source' in gltf_texture and 'images' in gltf:
-                    image_index = gltf_texture['source']
+                image_index = self._resolve_texture_source(gltf_texture)
+                if image_index is not None and 'images' in gltf:
                     if image_index < len(gltf['images']):
                         image = gltf['images'][image_index]
 
@@ -497,8 +515,8 @@ class GLBParser:
             texture_index = mr_texture['index']
             if 'textures' in gltf and texture_index < len(gltf['textures']):
                 gltf_texture = gltf['textures'][texture_index]
-                if 'source' in gltf_texture and 'images' in gltf:
-                    image_index = gltf_texture['source']
+                image_index = self._resolve_texture_source(gltf_texture)
+                if image_index is not None and 'images' in gltf:
                     if image_index < len(gltf['images']):
                         image = gltf['images'][image_index]
 
@@ -524,8 +542,8 @@ class GLBParser:
             texture_index = normal_texture['index']
             if 'textures' in gltf and texture_index < len(gltf['textures']):
                 gltf_texture = gltf['textures'][texture_index]
-                if 'source' in gltf_texture and 'images' in gltf:
-                    image_index = gltf_texture['source']
+                image_index = self._resolve_texture_source(gltf_texture)
+                if image_index is not None and 'images' in gltf:
                     if image_index < len(gltf['images']):
                         image = gltf['images'][image_index]
 
@@ -551,8 +569,8 @@ class GLBParser:
             texture_index = occlusion_texture['index']
             if 'textures' in gltf and texture_index < len(gltf['textures']):
                 gltf_texture = gltf['textures'][texture_index]
-                if 'source' in gltf_texture and 'images' in gltf:
-                    image_index = gltf_texture['source']
+                image_index = self._resolve_texture_source(gltf_texture)
+                if image_index is not None and 'images' in gltf:
                     if image_index < len(gltf['images']):
                         image = gltf['images'][image_index]
 
@@ -578,8 +596,8 @@ class GLBParser:
             texture_index = emissive_texture['index']
             if 'textures' in gltf and texture_index < len(gltf['textures']):
                 gltf_texture = gltf['textures'][texture_index]
-                if 'source' in gltf_texture and 'images' in gltf:
-                    image_index = gltf_texture['source']
+                image_index = self._resolve_texture_source(gltf_texture)
+                if image_index is not None and 'images' in gltf:
                     if image_index < len(gltf['images']):
                         image = gltf['images'][image_index]
 
